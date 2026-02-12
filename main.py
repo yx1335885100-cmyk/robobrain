@@ -1,416 +1,382 @@
 # -*- coding: utf-8 -*-
 """
-Humanoid Robot Brain - Main Entry
-人型机器人智慧大脑主入口
+Humanoid Robot Brain - LangGraph Version
+人型机器人智慧大脑 - LangGraph 版本
 
-这是机器人智慧大脑的主程序入口，整合所有模块实现完整的认知闭环:
-感知 -> 任务规划 -> 任务调度 -> 任务执行 -> 执行反馈 -> 规划调整
+基于 LangGraph 框架的完整认知闭环实现：
+感知 -> 规划 -> 调度 -> 执行 -> 反馈 -> 调整
+
+支持两种模式：
+1. LangGraph 模式（需要安装 langgraph）
+2. 模拟模式（无需额外依赖）
 """
 
 import asyncio
-import signal
+import time
 import sys
 import os
 
-# 添加项目根目录到路径
+# 检查依赖是否可用
+try:
+    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+    from langgraph.graph import StateGraph, END
+    from langgraph.checkpoint.memory import MemorySaver
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    LANGGRAPH_AVAILABLE = False
+    print("[Info] LangGraph not installed. Running in simulation mode.")
+    print("[Info] Install with: pip install langgraph langchain-core")
+
+# 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core.brain import RobotBrain, BrainState
-from core.task_manager import TaskManager, Task, TaskPriority, TaskStatus
-from core.task_planner import TaskPlanner
-from core.task_scheduler import TaskScheduler
-from core.task_executor import TaskExecutor
-
-from perception.asr_module import ASRModule
-from perception.vision_module import VisionModule
-from perception.sensor_fusion import SensorFusion
-
-from ros2_interface.joint_monitor import JointMonitor
-from ros2_interface.ros2_bridge import ROS2Bridge
-
-from skills.vln_skill import VLNSkill
-from skills.vla_skill import VLASkill
-from skills.skill_registry import SkillRegistry, get_registry
-
-from planning.global_planner import GlobalPlanner
-from planning.local_planner import LocalPlanner
-from planning.motion_planner import MotionPlanner
-
-from execution.action_executor import ActionExecutor
-from execution.feedback_handler import FeedbackHandler, FeedbackType
-
-from utils.logger import get_logger
-from utils.config import get_config
+# 导入核心模块
+from state import (
+    RobotState, BrainPhase, create_initial_state,
+    update_phase, increment_iteration
+)
+from tools import VLNTool, VLATool, NavigationTool, ManipulationTool
+from agents import PerceptionAgent, PlanningAgent, ExecutionAgent, SupervisorAgent
 
 
-class HumanoidRobotBrain:
+class SimpleStateGraph:
     """
-    人型机器人智慧大脑
-    
-    整合所有模块，提供完整的机器人智能控制能力
+    简化的状态图（不依赖 LangGraph）
     """
     
-    def __init__(self, config_path: str = None):
+    def __init__(self, state_schema):
+        self._nodes = {}
+        self._edges = {}
+        self._entry_point = None
+        self._state_schema = state_schema
+    
+    def add_node(self, name: str, func):
+        self._nodes[name] = func
+    
+    def add_edge(self, from_node: str, to_node: str):
+        if from_node not in self._edges:
+            self._edges[from_node] = []
+        self._edges[from_node].append(("edge", to_node))
+    
+    def add_conditional_edges(self, from_node: str, condition_func, edges: dict):
+        if from_node not in self._edges:
+            self._edges[from_node] = []
+        self._edges[from_node].append(("conditional", condition_func, edges))
+    
+    def set_entry_point(self, node_name: str):
+        self._entry_point = node_name
+    
+    def set_finish_point(self, node_name: str):
+        self._finish_point = node_name
+    
+    def compile(self, checkpointer=None):
+        return self
+    
+    def invoke(self, initial_state: dict, config: dict = None) -> dict:
+        """执行图"""
+        state = initial_state.copy()
+        current_node = self._entry_point
+        max_iterations = state.get("max_iterations", 10)
+        iteration = 0
+        
+        while current_node and iteration < max_iterations:
+            # 执行节点
+            if current_node in self._nodes:
+                node_func = self._nodes[current_node]
+                updates = node_func(state)
+                state.update(updates)
+                state["iteration_count"] = iteration + 1
+            
+            # 查找下一个节点
+            if current_node in self._edges:
+                for edge in self._edges[current_node]:
+                    if edge[0] == "edge":
+                        current_node = edge[1]
+                        break
+                    elif edge[0] == "conditional":
+                        condition_func = edge[1]
+                        edges = edge[2]
+                        next_node_name = condition_func(state)
+                        current_node = edges.get(next_node_name, "end")
+                        if current_node == "end":
+                            return state
+                        break
+            else:
+                break
+            
+            iteration += 1
+        
+        return state
+
+
+class HumanoidRobotBrainLangGraph:
+    """
+    人型机器人智慧大脑 - LangGraph 版本
+    
+    支持 LangGraph 和模拟两种模式
+    """
+    
+    def __init__(self, llm=None, config: dict = None):
         """
         初始化机器人智慧大脑
         
         Args:
-            config_path: 配置文件路径
+            llm: 大语言模型实例
+            config: 配置字典
         """
-        self.logger = get_logger('robot_brain')
-        self.config = get_config()
+        self.llm = llm
+        self.config = config or {}
+        self.langgraph_available = LANGGRAPH_AVAILABLE
         
-        # 加载配置
-        if config_path:
-            self.config.load(config_path)
-        self.config.load_from_env()
+        # 初始化工具
+        self._init_tools()
         
-        self.logger.info("Initializing Humanoid Robot Brain...")
+        # 初始化 Agent
+        self._init_agents()
         
-        # 初始化核心大脑
-        self.brain = RobotBrain(self.config.get_section('brain'))
+        # 创建图
+        self.graph = self._create_graph()
         
-        # 初始化感知模块
-        self._init_perception()
-        
-        # 初始化ROS2接口
-        self._init_ros2()
-        
-        # 初始化技能
-        self._init_skills()
-        
-        # 初始化规划模块
-        self._init_planning()
-        
-        # 初始化执行模块
-        self._init_execution()
-        
-        # 运行状态
-        self._running = False
-        
-        self.logger.info("Humanoid Robot Brain initialized successfully")
+        print(f"[HumanoidRobotBrain-LangGraph] Initialized (LangGraph: {LANGGRAPH_AVAILABLE})")
     
-    def _init_perception(self):
-        """初始化感知模块"""
-        self.logger.info("Initializing perception modules...")
-        
-        # ASR模块
-        asr_config = self.config.get('perception.asr', {})
-        self.asr = ASRModule()
-        self.asr.initialize()
-        
-        # 视觉模块
-        vision_config = self.config.get('perception.vision', {})
-        self.vision = VisionModule()
-        self.vision.initialize()
-        
-        # 传感器融合
-        self.sensor_fusion = SensorFusion()
-        self.sensor_fusion.register_asr(self.asr)
-        self.sensor_fusion.register_vision(self.vision)
-        
-        # 注册到大脑
-        self.brain.register_perception_module('asr', self.asr)
-        self.brain.register_perception_module('vision', self.vision)
-        
-        self.logger.info("Perception modules initialized")
+    def _init_tools(self):
+        """初始化工具"""
+        self.vln_tool = VLNTool()
+        self.vla_tool = VLATool()
+        self.navigation_tool = NavigationTool()
+        self.manipulation_tool = ManipulationTool()
     
-    def _init_ros2(self):
-        """初始化ROS2接口"""
-        self.logger.info("Initializing ROS2 interface...")
-        
-        # ROS2桥接
-        ros2_config = self.config.get_section('ros2')
-        self.ros2_bridge = ROS2Bridge(ros2_config.get('node_name', 'robot_brain'))
-        self.ros2_bridge.initialize()
-        
-        # 关节监测器
-        joint_update_rate = ros2_config.get('joint_update_rate', 100)
-        self.joint_monitor = JointMonitor(update_rate=joint_update_rate)
-        self.joint_monitor.initialize_ros2()
-        
-        # 注册到大脑
-        self.brain.register_ros2_bridge(self.ros2_bridge)
-        self.brain.register_joint_monitor(self.joint_monitor)
-        self.sensor_fusion.register_joint_monitor(self.joint_monitor)
-        
-        self.logger.info("ROS2 interface initialized")
+    def _init_agents(self):
+        """初始化 Agent"""
+        self.perception_agent = PerceptionAgent(self.llm)
+        self.planning_agent = PlanningAgent(self.llm)
+        self.execution_agent = ExecutionAgent(self.llm)
+        self.supervisor_agent = SupervisorAgent(self.llm)
     
-    def _init_skills(self):
-        """初始化技能"""
-        self.logger.info("Initializing skills...")
-        
-        # 获取技能注册表
-        self.skill_registry = get_registry()
-        
-        # VLN技能
-        self.vln_skill = VLNSkill()
-        self.vln_skill.set_ros2_bridge(self.ros2_bridge)
-        self.vln_skill.set_joint_monitor(self.joint_monitor)
-        self.brain.register_skill('vln', VLNSkill)
-        
-        # VLA技能
-        self.vla_skill = VLASkill()
-        self.vla_skill.set_vision_module(self.vision)
-        self.vla_skill.set_ros2_bridge(self.ros2_bridge)
-        self.vla_skill.set_joint_monitor(self.joint_monitor)
-        self.brain.register_skill('vla', VLASkill)
-        
-        self.logger.info("Skills initialized")
-    
-    def _init_planning(self):
-        """初始化规划模块"""
-        self.logger.info("Initializing planning modules...")
-        
-        self.global_planner = GlobalPlanner()
-        self.local_planner = LocalPlanner()
-        self.motion_planner = MotionPlanner()
-        
-        self.logger.info("Planning modules initialized")
-    
-    def _init_execution(self):
-        """初始化执行模块"""
-        self.logger.info("Initializing execution modules...")
-        
-        self.action_executor = ActionExecutor()
-        self.action_executor.set_ros2_bridge(self.ros2_bridge)
-        
-        self.feedback_handler = FeedbackHandler()
-        
-        # 注册反馈回调
-        self.feedback_handler.register_global_callback(self._on_feedback)
-        
-        self.logger.info("Execution modules initialized")
-    
-    def _on_feedback(self, feedback):
-        """处理反馈"""
-        if feedback.type == FeedbackType.ERROR:
-            self.logger.error(f"Feedback error from {feedback.source}: {feedback.message}")
-        elif feedback.type == FeedbackType.WARNING:
-            self.logger.warning(f"Feedback warning from {feedback.source}: {feedback.message}")
+    def _create_graph(self):
+        """创建图"""
+        if LANGGRAPH_AVAILABLE:
+            return self._create_langgraph()
         else:
-            self.logger.info(f"Feedback from {feedback.source}: {feedback.message}")
+            return self._create_simple_graph()
     
-    async def start(self):
-        """启动机器人智慧大脑"""
-        self.logger.info("Starting Humanoid Robot Brain...")
-        self._running = True
+    def _create_langgraph(self):
+        """创建 LangGraph 图"""
+        from langgraph.graph import StateGraph, END
         
-        # 启动感知模块
-        self.asr.start_listening()
-        self.vision.start_capture()
-        self.sensor_fusion.start_fusion()
+        workflow = StateGraph(RobotState)
         
-        # 启动关节监测
-        self.joint_monitor.start_monitoring()
+        # 添加节点
+        workflow.add_node("perception", self._perception_node)
+        workflow.add_node("planning", self._planning_node)
+        workflow.add_node("scheduling", self._scheduling_node)
+        workflow.add_node("execution", self._execution_node)
+        workflow.add_node("feedback", self._feedback_node)
         
-        # 启动ROS2
-        self.ros2_bridge.start_spinning()
+        # 设置入口
+        workflow.set_entry_point("perception")
         
-        # 启动反馈处理
-        self.feedback_handler.start()
+        # 添加边
+        workflow.add_edge("perception", "planning")
+        workflow.add_edge("planning", "scheduling")
+        workflow.add_edge("scheduling", "execution")
+        workflow.add_edge("execution", "feedback")
         
-        self.logger.info("Humanoid Robot Brain started")
-        
-        # 启动主循环
-        await self._main_loop()
-    
-    async def _main_loop(self):
-        """主循环"""
-        while self._running:
-            try:
-                # 执行认知循环
-                await self.brain.cognitive_cycle()
-                
-                # 短暂休眠
-                await asyncio.sleep(0.1)
-                
-            except Exception as e:
-                self.logger.error(f"Main loop error: {e}")
-                await asyncio.sleep(1)
-    
-    def stop(self):
-        """停止机器人智慧大脑"""
-        self.logger.info("Stopping Humanoid Robot Brain...")
-        self._running = False
-        
-        # 停止各模块
-        self.brain.stop()
-        self.asr.stop_listening()
-        self.vision.stop_capture()
-        self.sensor_fusion.stop_fusion()
-        self.joint_monitor.stop_monitoring()
-        self.ros2_bridge.shutdown()
-        self.feedback_handler.stop()
-        
-        self.logger.info("Humanoid Robot Brain stopped")
-    
-    async def submit_goal(self, goal: str) -> str:
-        """
-        提交目标
-        
-        Args:
-            goal: 目标描述
-            
-        Returns:
-            任务ID
-        """
-        self.logger.info(f"Submitting goal: {goal}")
-        return await self.brain.submit_goal(goal)
-    
-    async def execute_skill(self, skill_name: str, parameters: dict) -> dict:
-        """
-        直接执行技能
-        
-        Args:
-            skill_name: 技能名称
-            parameters: 技能参数
-            
-        Returns:
-            执行结果
-        """
-        self.logger.info(f"Executing skill: {skill_name}")
-        return await self.brain.execute_skill(skill_name, parameters)
-    
-    def get_status(self) -> dict:
-        """获取系统状态"""
-        status = {
-            'brain': self.brain.get_status(),
-            'perception': {
-                'asr': self.asr.get_statistics(),
-                'vision': self.vision.get_statistics(),
-                'fusion': self.sensor_fusion.get_statistics()
-            },
-            'ros2': {
-                'bridge': self.ros2_bridge.get_status(),
-                'joints': self.joint_monitor.get_statistics()
-            },
-            'skills': self.skill_registry.get_statistics(),
-            'execution': {
-                'actions': self.action_executor.get_statistics(),
-                'feedback': self.feedback_handler.get_statistics()
+        # 条件边
+        workflow.add_conditional_edges(
+            "feedback",
+            self._route_next,
+            {
+                "perception": "perception",
+                "planning": "planning",
+                "scheduling": "scheduling",
+                "execution": "execution",
+                "end": END
             }
-        }
-        return status
+        )
+        
+        return workflow.compile()
     
-    def get_joint_states(self) -> dict:
-        """获取关节状态"""
-        return self.brain.get_joint_states()
-
-
-async def main():
-    """主函数"""
-    print("=" * 60)
-    print("  Humanoid Robot Brain - 智慧大脑系统")
-    print("=" * 60)
+    def _create_simple_graph(self):
+        """创建简化图"""
+        workflow = SimpleStateGraph(RobotState)
+        
+        # 添加节点
+        workflow.add_node("perception", self._perception_node)
+        workflow.add_node("planning", self._planning_node)
+        workflow.add_node("scheduling", self._scheduling_node)
+        workflow.add_node("execution", self._execution_node)
+        workflow.add_node("feedback", self._feedback_node)
+        
+        # 设置入口
+        workflow.set_entry_point("perception")
+        
+        # 添加边
+        workflow.add_edge("perception", "planning")
+        workflow.add_edge("planning", "scheduling")
+        workflow.add_edge("scheduling", "execution")
+        workflow.add_edge("execution", "feedback")
+        
+        # 条件边
+        workflow.add_conditional_edges(
+            "feedback",
+            self._route_next,
+            {
+                "perception": "perception",
+                "planning": "planning",
+                "scheduling": "scheduling",
+                "execution": "execution",
+                "end": "end"
+            }
+        )
+        
+        return workflow
     
-    # 创建机器人智慧大脑
-    robot_brain = HumanoidRobotBrain()
+    def _perception_node(self, state: dict) -> dict:
+        """感知节点"""
+        return self.perception_agent.process(state)
     
-    # 设置信号处理
-    def signal_handler(sig, frame):
-        print("\nReceived shutdown signal...")
-        robot_brain.stop()
-        sys.exit(0)
+    def _planning_node(self, state: dict) -> dict:
+        """规划节点"""
+        return self.planning_agent.process(state)
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    def _scheduling_node(self, state: dict) -> dict:
+        """调度节点"""
+        tasks = state.get("tasks", {}).get("pending_tasks", [])
+        if tasks:
+            return {
+                "tasks": {
+                    **state.get("tasks", {}),
+                    "running_task": tasks[0],
+                    "pending_tasks": tasks[1:]
+                }
+            }
+        return {}
     
-    try:
-        # 启动系统
-        await robot_brain.start()
-    except KeyboardInterrupt:
-        print("\nKeyboard interrupt received...")
-    finally:
-        robot_brain.stop()
+    def _execution_node(self, state: dict) -> dict:
+        """执行节点"""
+        return self.execution_agent.process(state)
+    
+    def _feedback_node(self, state: dict) -> dict:
+        """反馈节点"""
+        last_result = state.get("execution", {}).get("last_result", {})
+        
+        # 更新任务状态
+        running_task = state.get("tasks", {}).get("running_task")
+        if running_task:
+            if last_result.get("success"):
+                completed = state.get("tasks", {}).get("completed_tasks", [])
+                completed.append({**running_task, "status": "completed"})
+                return {
+                    "tasks": {
+                        **state.get("tasks", {}),
+                        "running_task": None,
+                        "completed_tasks": completed
+                    }
+                }
+            else:
+                failed = state.get("tasks", {}).get("failed_tasks", [])
+                failed.append({**running_task, "status": "failed"})
+                return {
+                    "tasks": {
+                        **state.get("tasks", {}),
+                        "running_task": None,
+                        "failed_tasks": failed
+                    },
+                    "has_error": True,
+                    "error_message": last_result.get("error")
+                }
+        
+        return {}
+    
+    def _route_next(self, state: dict) -> str:
+        """路由决策"""
+        # 检查迭代次数
+        if state.get("iteration_count", 0) >= state.get("max_iterations", 10):
+            return "end"
+        
+        # 检查是否还有任务
+        if state.get("tasks", {}).get("pending_tasks"):
+            return "scheduling"
+        
+        # 检查是否有运行中的任务
+        if state.get("tasks", {}).get("running_task"):
+            return "execution"
+        
+        return "end"
+    
+    def run(self, user_input: str, session_id: str = None) -> dict:
+        """运行"""
+        session_id = session_id or f"session_{int(time.time())}"
+        
+        print(f"\n[HumanoidRobotBrain] Processing: {user_input}")
+        
+        # 创建初始状态
+        initial_state = create_initial_state(session_id)
+        initial_state["user_input"] = user_input
+        initial_state["goal"] = user_input
+        
+        # 执行图
+        result = self.graph.invoke(initial_state)
+        
+        return result
+    
+    def stream(self, user_input: str, session_id: str = None):
+        """流式运行"""
+        result = self.run(user_input, session_id)
+        yield {"final": result}
 
 
 def run_demo():
     """运行演示"""
-    async def demo():
-        print("\n" + "=" * 60)
-        print("  Running Demo - Humanoid Robot Brain")
-        print("=" * 60 + "\n")
-        
-        # 创建大脑实例
-        brain = HumanoidRobotBrain()
-        
-        # 启动系统
-        print("[Demo] Starting system...")
-        
-        # 启动感知
-        brain.asr.start_listening()
-        brain.vision.start_capture()
-        brain.sensor_fusion.start_fusion()
-        brain.joint_monitor.start_monitoring()
-        
-        print("\n[Demo] System initialized")
-        print("[Demo] Testing capabilities...\n")
-        
-        # 测试1：提交导航目标
-        print("-" * 40)
-        print("Test 1: VLN Navigation")
-        print("-" * 40)
-        result = await brain.execute_skill('vln', {
-            'instruction': '导航到厨房'
-        })
-        print(f"VLN Result: {result}\n")
-        
-        # 测试2：提交操作目标
-        print("-" * 40)
-        print("Test 2: VLA Manipulation")
-        print("-" * 40)
-        result = await brain.execute_skill('vla', {
-            'instruction': '帮我拿杯子'
-        })
-        print(f"VLA Result: {result}\n")
-        
-        # 测试3：查看关节状态
-        print("-" * 40)
-        print("Test 3: Joint State Monitoring")
-        print("-" * 40)
-        joint_states = brain.get_joint_states()
-        print(f"Joint positions: {list(joint_states.get('positions', {}).keys())[:5]}...")
-        print(f"Is moving: {joint_states.get('is_moving', False)}\n")
-        
-        # 测试4：模拟语音输入
-        print("-" * 40)
-        print("Test 4: ASR Simulation")
-        print("-" * 40)
-        asr_result = brain.asr.simulate_speech("请帮我打开灯")
-        print(f"ASR Result: {asr_result.text}\n")
-        
-        # 测试5：系统状态
-        print("-" * 40)
-        print("Test 5: System Status")
-        print("-" * 40)
-        status = brain.get_status()
-        print(f"Brain state: {status['brain']['state']}")
-        print(f"Registered skills: {status['brain']['registered_skills']}")
-        print(f"Perception modules: {status['brain']['registered_perception_modules']}\n")
-        
-        # 停止系统
-        print("[Demo] Stopping system...")
-        brain.stop()
-        
-        print("\n" + "=" * 60)
-        print("  Demo completed successfully!")
-        print("=" * 60 + "\n")
+    print("=" * 70)
+    print("  Humanoid Robot Brain - LangGraph Version")
+    print("  人型机器人智慧大脑 - LangGraph 版本演示")
+    print("=" * 70)
     
-    # 运行演示
-    asyncio.run(demo())
+    # 创建大脑实例
+    brain = HumanoidRobotBrainLangGraph()
+    
+    print("\n" + "-" * 50)
+    print("Demo 1: VLN Navigation")
+    print("-" * 50)
+    result = brain.run("导航到厨房")
+    last_result = result.get('execution', {}).get('last_result', {})
+    print(f"Success: {last_result.get('success', False)}")
+    print(f"Message: {last_result.get('message', 'N/A')}")
+    
+    print("\n" + "-" * 50)
+    print("Demo 2: VLA Manipulation")
+    print("-" * 50)
+    result = brain.run("帮我拿那个杯子")
+    last_result = result.get('execution', {}).get('last_result', {})
+    print(f"Success: {last_result.get('success', False)}")
+    print(f"Message: {last_result.get('message', 'N/A')}")
+    
+    print("\n" + "-" * 50)
+    print("Demo 3: System Status")
+    print("-" * 50)
+    print(f"Total iterations: {result.get('iteration_count', 0)}")
+    print(f"Completed tasks: {len(result.get('tasks', {}).get('completed_tasks', []))}")
+    print(f"Failed tasks: {len(result.get('tasks', {}).get('failed_tasks', []))}")
+    
+    print("\n" + "=" * 70)
+    print("  Demo Completed!")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Humanoid Robot Brain')
+    parser = argparse.ArgumentParser(description='Humanoid Robot Brain - LangGraph Version')
     parser.add_argument('--demo', action='store_true', help='Run demo mode')
-    parser.add_argument('--config', type=str, help='Config file path')
+    parser.add_argument('--input', type=str, help='Single input to process')
     
     args = parser.parse_args()
     
-    if args.demo:
-        run_demo()
+    if args.input:
+        brain = HumanoidRobotBrainLangGraph()
+        result = brain.run(args.input)
+        print(f"\nResult: {result}")
     else:
-        asyncio.run(main())
+        run_demo()
