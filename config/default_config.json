@@ -1,0 +1,68 @@
+{
+    "brain": {
+        "max_concurrent_tasks": 5,
+        "planning_strategy": "hierarchical",
+        "scheduling_algorithm": "priority_based",
+        "execution_mode": "sequential",
+        "enable_reflection": true,
+        "max_planning_iterations": 10
+    },
+    "ros2": {
+        "node_name": "robot_brain",
+        "joint_update_rate": 100
+    },
+    "perception": {
+        "asr": {
+            "sample_rate": 16000,
+            "language": "zh-CN",
+            "engine": "whisper"
+        },
+        "vision": {
+            "device_id": 0,
+            "width": 640,
+            "height": 480,
+            "fps": 30,
+            "models": ["detection"]
+        },
+        "fusion_rate": 10,
+        "buffer_size": 100
+    },
+    "planning": {
+        "global_planner": {
+            "max_sub_goals": 10,
+            "goal_templates_path": "./config/goal_templates.json"
+        },
+        "local_planner": {
+            "action_resolution": 0.1,
+            "max_replanning_attempts": 3
+        },
+        "motion_planner": {
+            "default_velocity": 0.5,
+            "default_acceleration": 0.5,
+            "collision_check": true,
+            "path_resolution": 0.01
+        }
+    },
+    "execution": {
+        "action_timeout": 60.0,
+        "max_retries": 3,
+        "feedback_buffer_size": 100
+    },
+    "skills": {
+        "vln": {
+            "max_linear_velocity": 0.5,
+            "max_angular_velocity": 1.0,
+            "safety_distance": 0.3
+        },
+        "vla": {
+            "grasp_force": 10.0,
+            "approach_speed": 0.1,
+            "retreat_distance": 0.1
+        }
+    },
+    "logging": {
+        "level": "INFO",
+        "file": null,
+        "format": "[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s"
+    }
+}
